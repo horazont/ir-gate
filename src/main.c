@@ -176,6 +176,24 @@ static inline __attribute__((always_inline)) uint8_t is_timer_enabled() {
     return TCCR1B != 0;
 }
 
+static inline __attribute__((always_inline)) void set_output_to(uint8_t en) {
+    TCNT0 = 0;
+    SOUT_EN_REG = (SOUT_EN_REG & (~SOUT_EN_BIT(1))) | SOUT_EN_BIT(en);
+}
+
+static inline __attribute__((always_inline)) void set_output_enable() {
+    TCNT0 = 0;
+    SOUT_EN_REG |= SOUT_EN_BIT(1);
+}
+
+static inline __attribute__((always_inline)) void clear_output_enable() {
+    SOUT_EN_REG &= ~SOUT_EN_BIT(1);
+}
+
+static inline __attribute__((always_inline)) uint8_t is_output_enabled() {
+    return SOUT_EN_REG & SOUT_EN_BIT(1);
+}
+
 // this is tricky! the amount of lost cycles because of the TSOP1738 depends on the signal quality (obviously)
 // 20 might be too much when signal conditions are excellent, but when signal conditions are terrible, 10 may be not enough
 #define SOUT_DELAY_H (0)
@@ -237,6 +255,7 @@ static inline void force_idle() {
     set_may_receive();
     set_forward_mode();
     set_inject_mode();
+    clear_output_enable();
 }
 
 #define MSG_END_OF_SYMBOL (0xff)
@@ -250,7 +269,7 @@ static inline void force_idle() {
 static void start_inject(uint8_t cmd) {
     const uint8_t count = cmd >> 1;
     const uint8_t en = (cmd & 1) ^ 1;
-    SOUT_EN_REG = (SOUT_EN_REG & (~SOUT_EN_BIT(1))) | SOUT_EN_BIT(en);
+    set_output_to(en);
     const uint16_t timer_value = (uint16_t)(count + 1) * 32;
     program_delay_u16(timer_value);
 }
@@ -266,7 +285,7 @@ ISR(PCINT0_vect) {
         return;
     }
 
-    const uint8_t output_enabled = SOUT_EN_REG & SOUT_EN_BIT(1);
+    const uint8_t output_enabled = is_output_enabled();
     if (output_enabled) {
         if (TCCR1B & TIMER_DELAY_FLAG) {
             // sin-repeat-delay state
@@ -315,7 +334,7 @@ ISR(PCINT0_vect) {
         }
 
         // enable output waveform
-        SOUT_EN_REG |= SOUT_EN_BIT(1);
+        set_output_enable();
         // configure timer
         program_counter();
 
@@ -331,7 +350,7 @@ ISR(PCINT0_vect) {
 }
 
 ISR(TIMER1_COMPA_vect) {
-    const uint8_t output_enabled = SOUT_EN_REG & SOUT_EN_BIT(1);
+    const uint8_t output_enabled = is_output_enabled();
     const uint8_t delay_mode = TCCR1B & TIMER_DELAY_FLAG;
     const uint8_t forward_mode = is_forward_mode();
     const uint8_t inject_mode = is_inject_mode();
@@ -339,8 +358,7 @@ ISR(TIMER1_COMPA_vect) {
     if (forward_mode && inject_mode) {
         // this should never ever happen. the timer is not enabled in idle, and the other ISRs disable the respective other mode first thing
         // disable the timer, clear the output, to return to idle state.
-        disable_timer();
-        SOUT_EN_REG &= ~SOUT_EN_BIT(1);
+        force_idle();
         return;
     }
 
@@ -350,7 +368,7 @@ ISR(TIMER1_COMPA_vect) {
         } else if (forward_mode && output_enabled) {
             // delay timer expired
             // disable output and configure hold timer
-            SOUT_EN_REG &= ~SOUT_EN_BIT(1);
+            clear_output_enable();
             program_delay(HOLD_DELAY_L, HOLD_DELAY_H);
         } else if (forward_mode && !output_enabled && delay_mode) {
             // hold timer expired
