@@ -8,7 +8,7 @@ OCFLAGS ?= --strip-unneeded
 SIZE = avr-size
 
 PROGRAM = main
-SRCS = main.c
+SRCS = src/main.c
 COMMONDEPS = 
 
 AVRDUDE=avrdude
