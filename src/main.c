@@ -19,81 +19,147 @@
 #define SOUT_EN_BIT(v) ((v)<<COM0A0) // toggle OC0A on compare match (iff WGM02 set)
 #define SOUT_EN_REG (TCCR0A)
 
+#define BUFFER_SIZE (0x08)
+#define BUFFER_MASK (0x07)
+
+#define TIMER_MODE_DISABLED (0)
 #define DELAY_EN_MASK ((1<<CS10) | (1<<CS11) | (1<<CS12))
-#define DELAY_EN_FLAG ((1<<CS11) | (1<<CS10)) // enabled, 64 prescaler (that way, a single iteration should be close to half a 38 kHz cycle)
+#define DELAY_EN_FLAG ((1<<CS11)) // enabled, div-8 prescaler (that way, we get a 1us timer)
+#define TIMER_DELAY_FLAG (1<<WGM12)
+#define TIMER_MODE_COUNTER (DELAY_EN_FLAG)
+#define TIMER_MODE_DELAY (DELAY_EN_FLAG | TIMER_DELAY_FLAG)
+
+// STATE MACHINE
+//                   COM0A0  TIMER1_EN  TIMER1_CTC
+// idle              0       0          x
+// sin-repeat-hi     1       1          0
+// sin-repeat-delay  1       1          1
+// sin-hold          0       1          1
+
+// TRANSITIONS
+// idle [PCINT0 w/ !SIN] -> sin-repeat-hi
+// idle [PCINT0 w/ SIN] -> idle
+// sin-repeat-hi [PCINT0 w/ SIN] -> sin-repeat-delay
+// sin-repeat-hi [PCINT0 w/ !SIN] -> sin-repeat-hi
+// sin-repeat-delay [PCINT0 w/ !SIN] -> sin-repeat-hi
+// sin-repeat-delay [PCINT0 w/ SIN] -> sin-repeat-delay
+// sin-repeat-delay [TIM1] -> sin-hold
+// sin-hold [PCINT0 w/ !SIN] -> sin-repeat-hi
+// sin-hold [PCINT0 w/ SIN] -> sin-hold
+// sin-hold [TIM1] -> idle
+
+// INTERRUPTS
+// PCINT0:
+//   [idle: !COM0A0 && !TIMER1_EN] && SIN -> idle (noop)
+//   [idle: !COM0A0 && !TIMER1_EN] && !SIN -> sin-repeat-hi: COM0A0 := 1, TIMER1_EN := 1, TIMER1_CTC := 0
+//   [sin-repeat-hi: COM0A0 && TIMER1_EN && !TIMER1_CTC] && SIN -> sin-repeat-delay: COM0A0 := 1, TIMER1_EN := 1, TIMER1_CTC := 1, emit duration, reset timer, set deadline
+//   [sin-repeat-hi: COM0A0 && TIMER1_EN && !TIMER1_CTC] && !SIN -> sin-repeat-hi (noop)
+//   [sin-repeat-delay: COM0A0 && TIMER1_EN && TIMER1_CTC] && SIN -> sin-repeat-delay (noop)
+// ! [sin-repeat-delay: COM0A0 && TIMER1_EN && TIMER1_CTC] && !SIN -> sin-repeat-hi: TIMER1_CTC := 0, reset timer, emit zero
+//   [sin-hold: !COM0A0 && TIMER1_EN && TIMER_CTC] && SIN -> sin-hold (noop)
+//   [sin-hold: !COM0A0 && TIMER1_EN && TIMER_CTC] && !SIN -> sin-repeat-hi: COM0A0 := 1, TIMER1_CTC := 0, emit duration, reset timer
+//
+// TIMER1_COMPA
+//   !TIMER1_EN -> noop
+//   [sin-repeat-hi: COM0A0 && TIMER1_EN && !TIMER1_CTC] -> emit 0xff (overflow)
+//   [sin-repeat-delay: COM0A0 && TIMER1_EN && TIMER1_CTC] -> COM0A0 := 0, reset timer
+//   [sin-hold: !COM0A0 && TIMER1_EN && TIMER1_CTC] -> TIMER1_EN := 0
 
 // this is tricky! the amount of lost cycles because of the TSOP1738 depends on the signal quality (obviously)
 // 20 might be too much when signal conditions are excellent, but when signal conditions are terrible, 10 may be not enough
 #define SOUT_DELAY_H (0)
-#define SOUT_DELAY_L (20)
+#define SOUT_DELAY_L (160)
 
-#define EXPIRE_DELAY_H (1)
-#define EXPIRE_DELAY_L (0)
+// 250 cycles of the 38 kHz carrier
+#define EXPIRE_DELAY_H (25)
+#define EXPIRE_DELAY_L (202)
 
-// TODO: this turns out to require a lot of instructions to access... might want to optimize this by abusing some register(s), which should be faster to access
-volatile uint8_t ownership = OWNER_NONE | OWNER_FIXED;
-
-static inline void set_timer_delay(uint8_t lo, uint8_t hi) {
+static inline __attribute__((always_inline)) void set_timer_delay(uint8_t lo, uint8_t hi) {
     OCR1AH = hi;
     OCR1AL = lo;
     TCNT1H = 0;
     TCNT1L = 0;
 }
 
-static inline void disable_timer() {
+static inline __attribute__((always_inline)) void disable_timer() {
     TCCR1B |= DELAY_EN_FLAG;
 }
 
-static inline void enable_timer() {
-    TCCR1B |= DELAY_EN_FLAG;
-}
-
-static inline void program_delay(uint8_t lo, uint8_t hi) {
+static inline __attribute__((always_inline)) void program_delay(uint8_t lo, uint8_t hi) {
     disable_timer();
     set_timer_delay(lo, hi);
-    enable_timer();
+    TCCR1B = TIMER_MODE_DELAY;
+}
+
+static inline __attribute__((always_inline)) void program_counter() {
+    disable_timer();
+    // counter shall notify us of overflow
+    set_timer_delay(EXPIRE_DELAY_L, EXPIRE_DELAY_H);
+    TCCR1B = TIMER_MODE_COUNTER;
+}
+
+static inline __attribute__((always_inline)) uint16_t read_timer() {
+    const uint8_t lo = TCNT1L;
+    const uint8_t hi = TCNT1H;
+    return (lo | (hi << 8));
 }
 
 ISR(PCINT0_vect) {
-    const uint8_t curr_owner = ownership & OWNER_PMASK;
-    // if someone who is not us is owning the output, we have to step back
-    if (curr_owner & ~OWNER_SIN) {
-        return;
-    }
+    // read input as soon as possible
     const uint8_t nen = (PINB & (1<<PINB0)) >> PINB0;
-    if (!nen) {
-        // enable the output immediately
-        TCNT0 = 0;
-        SOUT_EN_REG |= SOUT_EN_BIT(1);
-        // halt the delay timer, because we do not need it right now
-        disable_timer();
-        ownership = OWNER_SIN;
+
+    const uint8_t output_enabled = SOUT_EN_REG & SOUT_EN_BIT(1);
+    if (output_enabled) {
+        if (TCCR1B & TIMER_DELAY_FLAG) {
+            // sin-repeat-delay state
+            if (nen) {
+                // signal is low, so nothing to do (noise?)
+                return;
+            }
+            // XXX: signal is high while we were still emitting the "delay slot"
+            // while we can treat the lo-ness as noise, we cannot accurately reflect this via the serial, hence we emit a 0x00 here to signal the condition
+            // TODO: emit 0x00
+            program_counter();  // switches to sin-repeat-hi state, effectively
+        } else {
+            // sin-repeat-hi state
+            if (!nen) {
+                // signal is high, so nothing to do (noise?)
+                return;
+            }
+            // signal went low, enter delay state
+            // first we need to read the counter value
+            // TODO: emit duration
+            program_delay(SOUT_DELAY_L, SOUT_DELAY_H);  // switches to sin-repeat-delay state, effectively
+        }
     } else {
-        // program the delay to keep the output going for a few more cycles
-        program_delay(SOUT_DELAY_L, SOUT_DELAY_H);
-        ownership = OWNER_SIN;
+        // either sin-hold or idle states
+        // in both cases, we transition to sin-repeat-hi, if the input gets us a signal
+        if (nen) {
+            // no signal on input (noise?)
+            return;
+        }
+
+        // enable output waveform
+        SOUT_EN_REG |= SOUT_EN_BIT(1);
+        // configure timer
+        program_counter();
     }
 }
 
 ISR(TIMER1_COMPA_vect) {
-    disable_timer();
-    const uint8_t curr_owner = ownership;
-    const uint8_t sin_owned = curr_owner & OWNER_SIN;
-    const uint8_t expiring = curr_owner & OWNER_EXPIRING;
-    if (sin_owned && !expiring) {
-        // special case: this is the delay slot of the SIN-based output, because we have to compensate for the TS1738 having a delay
-        // disable the output
+    const uint8_t output_enabled = SOUT_EN_REG & SOUT_EN_BIT(1);
+    const uint8_t delay_mode = TCCR1B & TIMER_DELAY_FLAG;
+    if (!delay_mode && output_enabled) {
+        // TODO: emit 0xff to signal overflow, do not change state otherwise
+    } else if (output_enabled) {
+        // delay timer expired
+        // disable output and configure hold timer
         SOUT_EN_REG &= ~SOUT_EN_BIT(1);
-        // prepare ownership expiry
-        set_timer_delay(EXPIRE_DELAY_L, EXPIRE_DELAY_H);
-        enable_timer();
-        ownership = OWNER_SIN | OWNER_EXPIRING;
-        // here, we keep the timer enabled to be notified when the expiry is over
-        return;
-    }
-    if (expiring) {
-        // release ownership now
-        ownership = OWNER_NONE;
+        program_delay(EXPIRE_DELAY_L, EXPIRE_DELAY_H);
+    } else if (!output_enabled && delay_mode) {
+        // hold timer expired
+        // disable timer to return to idle state
+        disable_timer();
     }
 }
 
