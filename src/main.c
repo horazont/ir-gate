@@ -122,11 +122,13 @@ static inline __attribute__((always_inline)) uint8_t will_underrun() {
 
 // ONLY SAFE TO CALL FROM NON-NESTABLE INTERRUPTS
 static inline uint8_t should_slow_down() {
-    const uint8_t next = (BUFFER.wrptr + 1) & BUFFER_MASK;
-    const uint8_t soon = (BUFFER.wrptr + 2) & BUFFER_MASK;
-    const uint8_t later = (BUFFER.wrptr + 3) & BUFFER_MASK;
-    const uint8_t future = (BUFFER.wrptr + 4) & BUFFER_MASK;
-    return BUFFER.rdptr == future || BUFFER.rdptr == later || BUFFER.rdptr == soon || BUFFER.rdptr == next;
+    const uint8_t currw = BUFFER.wrptr;
+    const uint8_t next = (currw + 1) & BUFFER_MASK;
+    const uint8_t soon = (currw + 2) & BUFFER_MASK;
+    const uint8_t later = (currw + 3) & BUFFER_MASK;
+    const uint8_t future = (currw + 4) & BUFFER_MASK;
+    const uint8_t currr = BUFFER.rdptr;
+    return currr == future || currr == later || currr == soon || currr == next;
 };
 
 // ONLY SAFE TO CALL FROM NON-NESTABLE INTERRUPTS
