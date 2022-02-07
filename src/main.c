@@ -18,24 +18,23 @@
 
 #define SOUT_EN_BIT(v) ((v)<<COM0A0) // toggle OC0A on compare match (iff WGM02 set)
 #define SOUT_EN_REG (TCCR0A)
+#define SOUT_EN_SHIFT (COM0A0)
 
 #define BUFFER_SIZE (0x08)
 #define BUFFER_MASK (0x07)
 
-#define TIMER_MODE_DISABLED (0)
-#define DELAY_EN_MASK ((1<<CS10) | (1<<CS11) | (1<<CS12))
-#define DELAY_EN_FLAG ((1<<CS11)) // enabled, div-8 prescaler (that way, we get a 1us timer)
-#define TIMER_DELAY_FLAG (1<<WGM12)
-#define TIMER_MODE_COUNTER (DELAY_EN_FLAG)
-#define TIMER_MODE_DELAY (DELAY_EN_FLAG | TIMER_DELAY_FLAG)
+#define TIMER1_CLK_MASK ((1<<CS10) | (1<<CS11) | (1<<CS12))
+#define TIMER1_CLK_FLAG ((1<<CS11) | (1<<CS10)) // enabled, div-64 prescaler (that way, we get an 8us timer)
+#define TIMER1_MODE_DISABLED (0)
+#define TIMER1_MODE_COUNTER (TIMER1_CLK_FLAG)
 
 // STATE MACHINE
-//                   COM0A0  TIMER1_EN  TIMER1_CTC  MAY_RECEIVE  PCINT0  RXCIE
-// idle              x       0          x           x            1       1
-// sin-repeat-hi     1       1          0           0            1       0
-// sin-repeat-delay  1       1          1           0            1       0
-// sin-hold          0       1          1           0            1       0
-// inject            x       1          1           x            0       1
+//                   COM0A0  TIMER1_EN  MAY_RECEIVE  PCINT0  RXCIE  OCIE1A
+// idle              x       0          x            1       1      0
+// sin-repeat-hi     1       1          0            1       0      1
+// sin-repeat-delay  1       1          0            1       0      0
+// sin-hold          0       1          0            1       0      1
+// inject            x       1          x            0       1      0
 
 // TRANSITIONS
 // idle [PCINT0 w/ !SIN] -> sin-repeat-hi
@@ -60,23 +59,26 @@
 // INTERRUPTS
 // PCINT0:
 //   [idle: !TIMER1_EN] && SIN -> idle (noop)
-//   [idle: !TIMER1_EN] && !SIN -> sin-repeat-hi: COM0A0 := 1, TIMER1_EN := 1, TIMER1_CTC := 0, RXCIE := 0
-//   [sin-repeat-hi: COM0A0 && TIMER1_EN && !TIMER1_CTC] && SIN -> sin-repeat-delay: COM0A0 := 1, TIMER1_EN := 1, TIMER1_CTC := 1, emit duration, reset timer, set deadline
-//   [sin-repeat-hi: COM0A0 && TIMER1_EN && !TIMER1_CTC] && !SIN -> sin-repeat-hi (noop)
-//   [sin-repeat-delay: COM0A0 && TIMER1_EN && TIMER1_CTC] && SIN -> sin-repeat-delay (noop)
-// ! [sin-repeat-delay: COM0A0 && TIMER1_EN && TIMER1_CTC] && !SIN -> sin-repeat-hi: TIMER1_CTC := 0, reset timer, emit zero
-//   [sin-hold: !COM0A0 && TIMER1_EN && TIMER_CTC] && SIN -> sin-hold (noop)
-//   [sin-hold: !COM0A0 && TIMER1_EN && TIMER_CTC] && !SIN -> sin-repeat-hi: COM0A0 := 1, TIMER1_CTC := 0, emit duration, reset timer
+//   [idle: !TIMER1_EN] && !SIN -> sin-repeat-hi: COM0A0 := 1, TIMER1_EN := 1, OCIE1B := 1, RXCIE := 0, set OCR1AL = 0xff, OCR1AH = 0
+//   [sin-repeat-hi: COM0A0 && TIMER1_EN && OCIE1A] && SIN -> sin-repeat-delay: COM0A0 := 1, TIMER1_EN := 1, OCIE1B := 0, emit duration, reset timer, set deadline
+//   [sin-repeat-hi: COM0A0 && TIMER1_EN && OCIE1A] && !SIN -> sin-repeat-hi (noop)
+//   [sin-repeat-delay: COM0A0 && TIMER1_EN && !OCIE1A] && SIN -> sin-repeat-delay (noop)
+// ! [sin-repeat-delay: COM0A0 && TIMER1_EN && !OCIE1A] && !SIN -> sin-repeat-hi: TIMER1_CTC := 0, reset timer, emit zero
+//   [sin-hold: !COM0A0 && TIMER1_EN && OCIE1A] && SIN -> sin-hold (noop)
+//   [sin-hold: !COM0A0 && TIMER1_EN && OCIE1A] && !SIN -> sin-repeat-hi: COM0A0 := 1, TIMER1_CTC := 0, emit duration, reset timer
 //   [inject: RXCIE] -> inject; PCINT0 := 0
 //
-// TIMER1_COMPA
+// TIMER1_COMPB
 //   !TIMER1_EN -> noop
-//   [sin-repeat-hi: PCINT0 && COM0A0 && TIMER1_EN && !TIMER1_CTC] -> emit 0xfe (overflow)
-//   [sin-repeat-delay: PCINT0 && COM0A0 && TIMER1_EN && TIMER1_CTC] -> COM0A0 := 0, reset timer
+//   [sin-repeat-hi: PCINT0 && COM0A0 && TIMER1_EN && OCIE1A] -> force idle, too long a symbol
+//   [sin-repeat-delay: PCINT0 && COM0A0 && TIMER1_EN && !OCIE1A] -> COM0A0 := 0, OCIE1A := 1
 //   [sin-hold: PCINT0 && !COM0A0 && TIMER1_EN && TIMER1_CTC] -> idle: TIMER1_EN := 0, PCINT0 := 1, RXCIE := 1, emit 0xff (end of symbol)
 //   [inject: RXCIE] && buffer non empty -> inject: COM0A0 := v, TIMER1_EN := 1, TIMER1_CTC := 1, PCINT0 := 0, set timer to value
 //   [inject: RXCIE] && buffer empty && COM0A0 -> inject: synthesize end of symbol
 //   [inject: RXCIE] && buffer empty && !COM0A0 -> idle: TIMER1_EN := 0, PCINT0 := 1, RXCIE := 1
+//
+// TIMER1_COMPA
+//   increase OCR1AH by one, emit overflow frame according to output status
 //
 // RXC:
 //   [idle: !COM0A0 && !TIMER1_EN] -> inject: COM0A0 := v, TIMER1_EN := 1, TIMER1_CTC := 1, PCINT0 := 0, set timer to value
@@ -194,54 +196,118 @@ static inline __attribute__((always_inline)) uint8_t is_output_enabled() {
     return SOUT_EN_REG & SOUT_EN_BIT(1);
 }
 
-// this is tricky! the amount of lost cycles because of the TSOP1738 depends on the signal quality (obviously)
-// 20 might be too much when signal conditions are excellent, but when signal conditions are terrible, 10 may be not enough
+static inline __attribute__((always_inline)) uint8_t is_output_enabled_bit() {
+    return is_output_enabled() >> SOUT_EN_SHIFT;
+}
+
+static inline __attribute__((always_inline)) void set_counting_for_forwarding() {
+    OCR1AH = 0;
+    OCR1AL = 0xff;
+    TIMSK |= (1<<OCIE1A);
+}
+
+static inline __attribute__((always_inline)) void clear_counting_for_forwarding() {
+    TIMSK &= ~(1<<OCIE1A);
+}
+
+static inline __attribute__((always_inline)) uint8_t is_counting_for_forwarding() {
+    return TIMSK & (1<<OCIE1A);
+}
+
+static inline void send_counter(uint16_t cnt, uint8_t pause_bit) {
+    // cnt is in units of 8us, we want units of 16us -> strip the least significant bit
+    // output is shifted to the left by one bit, but we already stripped the LSB by masking it
+    // LSB should be pause bit
+    // most simple assembly of output ever ^_^
+    const uint8_t value = (cnt & 0xfe) | pause_bit;
+    UDR = value;
+}
+
+// TIMING REQUIREMENTS
+//
+// Minimum pulse length: 158us
+// Common maximum pulse length: 4000us, could possibly do with 2000us especially for DENON coding
+// Maximum pulse length: 9000us (27100us for NIKON, 15500us for B&O which we deliberately not support for now)
+//
+// More notes:
+// - we can send at most 7 bits of length information per UART frame -- we need one bit for pulse vs. pause
+// - one UART frame takes 100us (or 800 instructions) to transmit
+// - a 38 kHz cycle is 26.316 us (26 us for our odd frequency)
+// - => we can send one UART frame per ~four strobes of 38 kHz clock at most
+// - the timer can run at periods of 0.125 us, 1 us, 8 us, or 32 us
+// - we need four special symbols for the UART output:
+//   - overflow pulse
+//   - overflow pause
+//   - underflow pause
+//   - end-of-symbol(? possibly not needed)
+//
+// Solution:
+// - Timer resolution is configured to 8us (64 step prescaler)
+// - Input/output count duration in units of 16us
+//   => minimum 16us (~half a 38 kHz strobe), maximum 2032us
+// - When the timer overflows (use COMPB for that maybe, to have it separate from the expiry of the timer), send an overflow/repeat frame
+//   This is O(t) for long signals
+// - Consider a pause of 30ms end-of-signal
+//   This is longer than the repeat interval of any
+//
+// UART Coding:
+// - least significant bit is pulse(0)/pause(1)
+// - remaining seven bits are duration in units of 16us
+// - End of symbol: 0x00 (zero-length pulse) after a pause
+// - Underflow: 0x01 (zero-length pause) after a pulse
+// - Overflows are coded by transmitting the same LSB twice or more times in a row (which should cause an addition)
+//
+// Timeouts/Deadlines:
+// - "delay slot" (continuation of the 38 kHz signal after end of pulse to accomodate slow IR ICs): 56us (slightly more than two full cycles; seven counts of TIMER1)
+// - "hold" (locking of the output after the last pulse and time until end of symbol): 16ms (2000 counts of TIMER1)
+//
+// Remaining issues:
+// - How can the receiving end of our UART symbols reliably detect repeat frames and their timing? Do we care about the accurate timing? Probably not.
+// - Implementation of overflow checking using COMPB -- we only need to use COMPB to emit overflow frames, we do NOT need to keep track of anything as the mod operation required for sending the final frame is just an &
+
 #define SOUT_DELAY_H (0)
-#define SOUT_DELAY_L (160)
+#define SOUT_DELAY_L (7)
 
-// 250 cycles of the 38 kHz carrier
-#define EXPIRE_DELAY_H (25)
-#define EXPIRE_DELAY_L (202)
-
-// 2.5ms should be plenty to detect end-of-symbol, while allowing for proper repeats
-#define HOLD_DELAY_H (9)
-#define HOLD_DELAY_L (205)
+// 16ms
+#define HOLD_DELAY_H (0x07)
+#define HOLD_DELAY_L (0xd0)
 
 static inline __attribute__((always_inline)) void set_timer_delay(uint8_t lo, uint8_t hi) {
-    OCR1AH = hi;
-    OCR1AL = lo;
+    OCR1BH = hi;
+    OCR1BL = lo;
     TCNT1H = 0;
     TCNT1L = 0;
 }
 
 static inline __attribute__((always_inline)) void set_timer_delay_u16(uint16_t d) {
-    OCR1AH = (d >> 8) & 0xff;
-    OCR1AL = d & 0xff;
+    OCR1BH = (d >> 8) & 0xff;
+    OCR1BL = d & 0xff;
     TCNT1H = 0;
     TCNT1L = 0;
 }
 
 static inline __attribute__((always_inline)) void disable_timer() {
-    TCCR1B = TIMER_MODE_DISABLED;
+    TCCR1B = TIMER1_MODE_DISABLED;
 }
 
 static inline __attribute__((always_inline)) void program_delay(uint8_t lo, uint8_t hi) {
     disable_timer();
     set_timer_delay(lo, hi);
-    TCCR1B = TIMER_MODE_DELAY;
+    TCCR1B = TIMER1_MODE_COUNTER;
 }
 
 static inline __attribute__((always_inline)) void program_delay_u16(uint16_t d) {
     disable_timer();
     set_timer_delay_u16(d);
-    TCCR1B = TIMER_MODE_DELAY;
+    TCCR1B = TIMER1_MODE_COUNTER;
 }
 
 static inline __attribute__((always_inline)) void program_counter() {
     disable_timer();
     // counter shall notify us of overflow
-    set_timer_delay(EXPIRE_DELAY_L, EXPIRE_DELAY_H);
-    TCCR1B = TIMER_MODE_COUNTER;
+    set_counting_for_forwarding();
+    set_timer_delay(0xff, 0xff);
+    TCCR1B = TIMER1_MODE_COUNTER;
 }
 
 static inline __attribute__((always_inline)) uint16_t read_timer() {
@@ -256,21 +322,19 @@ static inline void force_idle() {
     set_forward_mode();
     set_inject_mode();
     clear_output_enable();
+    clear_counting_for_forwarding();
 }
 
-#define MSG_END_OF_SYMBOL (0xff)
-#define MSG_OVERFLOW (0xfe)
-#define MSG_UNDERFLOW (0x01)
-#define MSG_FLAG_PAUSE (0x01)
+#define MSG_END_OF_SYMBOL (0x00)
 
-// ~2.5 ms of pause
-#define CMD_END_OF_SYMBOL (0x9d)
+// force a pause of maximum length
+#define CMD_END_OF_SYMBOL (0xff)
 
 static void start_inject(uint8_t cmd) {
-    const uint8_t count = cmd >> 1;
+    const uint8_t count = (cmd & 0xfe);
     const uint8_t en = (cmd & 1) ^ 1;
     set_output_to(en);
-    const uint16_t timer_value = (uint16_t)(count + 1) * 32;
+    const uint16_t timer_value = (uint16_t)(count + 1);
     program_delay_u16(timer_value);
 }
 
@@ -287,17 +351,7 @@ ISR(PCINT0_vect) {
 
     const uint8_t output_enabled = is_output_enabled();
     if (output_enabled) {
-        if (TCCR1B & TIMER_DELAY_FLAG) {
-            // sin-repeat-delay state
-            if (nen) {
-                // signal is low, so nothing to do (noise?)
-                return;
-            }
-            // XXX: signal is high while we were still emitting the "delay slot"
-            // while we can treat the lo-ness as noise, we cannot accurately reflect this via the serial, hence we emit a 0x00 here to signal the condition
-            UDR = MSG_UNDERFLOW;
-            program_counter();  // switches to sin-repeat-hi state, effectively
-        } else {
+        if (is_counting_for_forwarding()) {
             // sin-repeat-hi state
             if (!nen) {
                 // signal is high, so nothing to do (noise?)
@@ -306,15 +360,19 @@ ISR(PCINT0_vect) {
             // signal went low, enter delay state
             // first we need to read the counter value
             const uint16_t value = read_timer();
-            program_delay(SOUT_DELAY_L, SOUT_DELAY_H);  // switches to sin-repeat-delay state, effectively
-            // we count in units of 32 us; that should suffice for all the protocols, while not causing us overflows. (units of 32us let the division degrade into a shr)
-            // round properly
-            const uint8_t count = ((value + 16) / 32 + 1) << 1;
-            if (count >= MSG_OVERFLOW) {
-                UDR = MSG_OVERFLOW - 2;  // minus two to keep the signalling of signal vs. pause
-            } else {
-                UDR = count;
+            // switches to sin-repeat-delay state, effectively
+            program_delay(SOUT_DELAY_L, SOUT_DELAY_H);
+            clear_counting_for_forwarding();
+            send_counter(value, 0);
+        } else {
+            // sin-repeat-delay state
+            if (nen) {
+                // signal is low, so nothing to do (noise?)
+                return;
             }
+            // XXX: signal is high while we were still emitting the "delay slot"
+            // switch to sin-repeat-hi state, effectively, while re-using the current counter; this treats the short pause as noise.
+            program_counter();
         }
     } else {
         // either sin-hold or idle states
@@ -324,13 +382,14 @@ ISR(PCINT0_vect) {
             return;
         }
 
-        clear_may_receive();
-        clear_inject_mode();
-
         uint16_t value = 0;
         if (timer_enabled) {
             // if timer enabled, we need to send the current count once we recorded the transition
             value = read_timer();
+        } else {
+            // coming from idle, need to switch modes
+            clear_may_receive();
+            clear_inject_mode();
         }
 
         // enable output waveform
@@ -339,19 +398,26 @@ ISR(PCINT0_vect) {
         program_counter();
 
         if (value > 0) {
-            const uint8_t count = ((value + 16) / 32 + 1) << 1;
-            if (count >= MSG_OVERFLOW) {
-                UDR = MSG_OVERFLOW - 1;  // minus one to keep the pause flag
-            } else {
-                UDR = count | 1;  // add the pause flag
-            }
+            send_counter(value, 1);
         }
     }
 }
 
 ISR(TIMER1_COMPA_vect) {
+    const uint8_t output_enabled = is_output_enabled_bit();
+    const uint8_t pause_bit = output_enabled ^ 1;
+    (void)OCR1AL;
+    const uint8_t cnt = OCR1AH;
+    OCR1AH = cnt + 1;
+    OCR1AL = 0xff;
+    UDR = 0xfe | pause_bit;
+}
+
+// NOTE: we use COMPB for orchestration, because COMPA has a higher priority
+// over PCINT0, and we need high priority over PCINT0 for overflow handling in
+// COMPA
+ISR(TIMER1_COMPB_vect) {
     const uint8_t output_enabled = is_output_enabled();
-    const uint8_t delay_mode = TCCR1B & TIMER_DELAY_FLAG;
     const uint8_t forward_mode = is_forward_mode();
     const uint8_t inject_mode = is_inject_mode();
 
@@ -363,16 +429,21 @@ ISR(TIMER1_COMPA_vect) {
     }
 
     if (forward_mode) {
-        if (!delay_mode && output_enabled) {
-            UDR = MSG_OVERFLOW;
-        } else if (forward_mode && output_enabled) {
-            // delay timer expired
-            // disable output and configure hold timer
-            clear_output_enable();
-            program_delay(HOLD_DELAY_L, HOLD_DELAY_H);
-        } else if (forward_mode && !output_enabled && delay_mode) {
-            // hold timer expired
-            // disable timer to return to idle state, emit end of symbol
+        const uint8_t is_forwarding = is_counting_for_forwarding();
+        if (output_enabled) {
+            if (is_forwarding) {
+                // sin-repeat-hi: massive overflow (1s symbol), force idle
+                force_idle();
+            } else {
+                // sin-repeat-delay: end of delay, switch to pause mode
+                set_counting_for_forwarding();
+                // not going through program_delay or so because those clear the counter, which we do not want
+                OCR1BH = HOLD_DELAY_H;
+                OCR1BL = HOLD_DELAY_L;
+                clear_output_enable();
+            }
+        } else {
+            // sin-hold: hold timer expired, emit end-of-symbol and enter idle state
             UDR = MSG_END_OF_SYMBOL;
             force_idle();
         }
@@ -438,6 +509,12 @@ int main() {
     DDRD = ( 0
              | (1<<DDD4)  // CTS
              );
+    PORTB = (0
+             | (1<<PORTB2)  // pull PWM output high if disabled (the level shifter is inverting)
+             );
+    PORTD = (0
+             | (1<<PORTD5)  // baud rate configuration pin; pull up by default
+             );
 
     /** 38 kHz PWM configuration */
 
@@ -452,7 +529,7 @@ int main() {
                 /* WGM02 := */ | (1<<WGM02)  // count up to OCR0A
                 /* CS0   := */ | (1<<CS00)   // enabled, no prescaler
                 );
-    OCR0A = 54;  // this gives roughly 38 kHz on my thing, when running with 8 MHz clkio (from internal RC). might need tuning.
+    OCR0A = 52;  // this provides 38.46 kHz on an 8 MHz clock; that should be ok. The IR receiver IC in the AVR has a band pass for 37 kHz..40kHz, so I'd like to err on the high side here.
 
     /** signal input interrupt configuration */
 
@@ -469,16 +546,21 @@ int main() {
     TCCR1C |= 0;
     TCCR1B |= 0;
     TIMSK |= ( 0
-               | (1<<OCIE1A)
+               | (1<<OCIE1B)
                );
 
     /** USART configuration */
 
-    // baud rate follows from fosc / (16 * (UBRR + 1); division by 8 because async mode with double speed
-    // we can not reasonably reach beyond 38400 with that.
-    UBRRH = 0;
-    UBRRL = 12;
-    // => 38461 Baud, should be close enough. this allows us to send a delay symbol every ~ten strobes of the 38 kHz clock (260 us), which should be good enough for everything, as most codes use symbols longer than that (at least pauses)
+    // baud rate follows from fosc / (16 * (UBRR + 1); division by 16 because async mode
+    if (PIND & (1<<PIND5)) {
+        // Non-standard 100000 Baud
+        UBRRH = 0;
+        UBRRL = 4;
+    } else {
+        UBRRH = 0;
+        UBRRL = 12;
+        // => 38461 Baud, should be close enough. this allows us to send a delay symbol every ~ten strobes of the 38 kHz clock (260 us), which should be good enough for everything, as most codes use symbols longer than that (at least pauses)
+    }
     UCSRA = ( 0
               // | (1<<U2X) // double speed mode
               );
