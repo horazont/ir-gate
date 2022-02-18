@@ -518,11 +518,11 @@ int main() {
     DDRD = ( 0
              | (1<<DDD4)  // CTS
              );
-    PORTB = (0
-             | (1<<PORTB2)  // pull PWM output high if disabled (the level shifter is inverting)
-             );
     PORTD = (0
              | (1<<PORTD5)  // baud rate configuration pin; pull up by default
+             );
+    PORTB = (0
+             | (1<<PORTB1)  // inverting mode configuration pin
              );
 
     /** 38 kHz PWM configuration */
@@ -557,6 +557,12 @@ int main() {
     TIMSK |= ( 0
                | (1<<OCIE1B)
                );
+
+    /** late configuration of PWM output */
+    // if PINB1 is pulled low ...
+    if ((PINB & (1<<PINB1)) == 0) {
+        PORTB |= (1<<PORTB2);  // .. pull PWM output high if disabled (to invert the output)
+    }
 
     /** USART configuration */
 
