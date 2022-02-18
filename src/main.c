@@ -29,12 +29,19 @@
 #define TIMER1_MODE_COUNTER (TIMER1_CLK_FLAG)
 
 // STATE MACHINE
-//                   COM0A0  TIMER1_EN  MAY_RECEIVE  PCINT0  RXCIE  OCIE1A
-// idle              x       0          x            1       1      0
-// sin-repeat-hi     1       1          0            1       0      1
-// sin-repeat-delay  1       1          0            1       0      0
-// sin-hold          0       1          0            1       0      1
-// inject            x       1          x            0       1      0
+//
+// PD4 = CTS ("may receive")
+// COM0A0 controls waveform output
+// PCINT0 controls demodulated input
+// RXCIE controls UART input
+// OCIE1A controls timer overflow handling
+//
+//                   COM0A0  TIMER1_EN  PD4  PCINT0  RXCIE  OCIE1A
+// idle              x       0          x    1       1      0
+// sin-repeat-hi     1       1          0    1       0      1
+// sin-repeat-delay  1       1          0    1       0      0
+// sin-hold          0       1          0    1       0      1
+// inject            x       1          x    0       1      0
 
 // TRANSITIONS
 // idle [PCINT0 w/ !SIN] -> sin-repeat-hi
