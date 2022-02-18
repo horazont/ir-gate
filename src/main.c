@@ -349,7 +349,7 @@ static void start_inject(uint8_t cmd) {
 
 ISR(PCINT0_vect) {
     // read input as soon as possible
-    const uint8_t nen = (PINB & (1<<PINB0)) >> PINB0;
+    const uint8_t en = (PINB & (1<<PINB0)) >> PINB0;
     const uint8_t timer_enabled = is_timer_enabled();
 
     if (timer_enabled && is_inject_mode()) {
@@ -362,7 +362,7 @@ ISR(PCINT0_vect) {
     if (output_enabled) {
         if (is_counting_for_forwarding()) {
             // sin-repeat-hi state
-            if (!nen) {
+            if (en) {
                 // signal is high, so nothing to do (noise?)
                 return;
             }
@@ -375,7 +375,7 @@ ISR(PCINT0_vect) {
             send_counter(value, 0);
         } else {
             // sin-repeat-delay state
-            if (nen) {
+            if (!en) {
                 // signal is low, so nothing to do (noise?)
                 return;
             }
@@ -386,7 +386,7 @@ ISR(PCINT0_vect) {
     } else {
         // either sin-hold or idle states
         // in both cases, we transition to sin-repeat-hi, if the input gets us a signal
-        if (nen) {
+        if (!en) {
             // no signal on input (noise?)
             return;
         }
